@@ -9,6 +9,12 @@
 //   ② 节次表头是全角连字符「1－2」，用 /\d+/g 取数字
 //   ③ 格内 kbcontent1 是隐藏旧数据，查询必须精确写 div.kbcontent，否则课程翻倍
 //   ④ 页面有两个 id=kbtable 的表，第二个是页脚周次表，开学日期与总周次从那里读
+//
+// 整体包在 IIFE 里：App 每次点「执行导入」都会把本文件整个重新 evaluate 一次，
+// 顶层若直接写 const/function，第二次会抛 "Identifier 'KB_PATH' has already been
+// declared" —— 脚本在进入 runImportFlow 之前就崩了，点第二次毫无反应。
+
+(function () {
 
 const KB_PATH = "/jsxsd/xskb/xskb_list.do";
 
@@ -89,15 +95,18 @@ function parseSections(thText) {
     return [parseInt(nums[0], 10), parseInt(nums[0], 10)];
 }
 
-// 周次：'3-12(周)' / '1,3,5(周)' / '2-4,8-20双周'
+// 周次：'3-12(周)' / '1,3,5(周)' / '2-4,8-20双周' / '3-12(周)[01-02节]'
 // 单双标记有 (单)/(双)/(单周)/(双周)/裸「双周」等形态
 function parseWeeks(weekStr) {
     const weeks = [];
     if (!weekStr) return weeks;
 
     let odd = false, even = false;
-    // 括号整段摘掉，避免标记残留在数字段
-    let rest = String(weekStr).replace(/[（(][^）)]*[）)]/g, '');
+    // 圆括号与方括号整段摘掉。方括号里是节次（如 '[01-02节]'），
+    // 不摘的话数字会粘成 '3-1201-02' 导致区间匹配失败、只剩第 3 周
+    let rest = String(weekStr)
+        .replace(/[（(][^）)]*[）)]/g, '')
+        .replace(/[\[【][^\]】]*[\]】]/g, '');
     // 单双只看括号内，避免课程名里的「双」字被误判
     if (/[（(][^）)]*单[^）)]*[）)]/.test(weekStr)) odd = true;
     if (/[（(][^）)]*双[^）)]*[）)]/.test(weekStr)) even = true;
@@ -343,10 +352,13 @@ function mergeCourses(courses) {
     return out;
 }
 
-// 页面当前选中的学期 id（selected 由服务端渲染），仅用于开学日期兜底估算
+// 页面当前选中的学期 id，仅用于开学日期兜底估算。
+// 优先读 select.value：用户在前端切换后 DOM property 会变，
+// 而 HTML attribute `selected` 仍停留在服务端渲染时的默认值。
 function currentSemesterId(doc) {
     const select = doc.getElementById('xnxq01id');
     if (!select) return null;
+    if (select.value) return select.value;
     const opt = select.querySelector('option[selected]') || select.querySelector('option');
     return opt ? opt.getAttribute('value') : null;
 }
@@ -467,6 +479,10 @@ async function runImportFlow() {
         let semesterStartDate = sem.startDate;
         if (!semesterStartDate) {
             semesterStartDate = await promptSemesterStartDate(currentSemesterId(doc));
+            if (!semesterStartDate) {
+                window.shiguangBridge.showToast("已取消：未填写开学日期");
+                return;
+            }
         }
 
         await saveImportResult(courses, semesterStartDate, sem.totalWeeks || 20);
@@ -480,12 +496,7 @@ async function runImportFlow() {
     }
 }
 
-// 入口：WebView 中桥接就绪即执行
-if (typeof window !== 'undefined' && window.shiguangBridgePromise) {
-    runImportFlow();
-}
-
-// Node 下只导出函数供测试，浏览器中不存在 module
+// Node 下把要供测试的函数交给外层；浏览器里没有 module，忽略即可
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         parseSchedule, parseDoc, parseWeeks, parseSections, parseKbContent,
@@ -493,3 +504,16 @@ if (typeof module !== 'undefined' && module.exports) {
         guessSemesterStartDate, cleanTeacher
     };
 }
+
+// 供 showPrompt 按字符串名回调的校验函数，IIFE 内需显式挂到 window
+if (typeof window !== 'undefined') {
+    window.validateDateInput = validateDateInput;
+    window.runImportFlow = runImportFlow;   // 挂出口供离线测试直接驱动流程
+}
+
+// 入口：WebView 中桥接就绪即执行
+if (typeof window !== 'undefined' && window.shiguangBridgePromise) {
+    runImportFlow();
+}
+
+})();
