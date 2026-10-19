@@ -44,11 +44,6 @@ function pageHasSchedule() {
     }
 }
 
-/** 当前页是否在教务域内且没有课表 —— 此时才允许发同源请求兜底 */
-function needFetchFallback() {
-    return !pageHasSchedule() && isOnJwHost();
-}
-
 const WEEKDAY_MAP = {
     '星期一': 1, '星期二': 2, '星期三': 3, '星期四': 4,
     '星期五': 5, '星期六': 6, '星期日': 7, '星期天': 7
@@ -78,9 +73,8 @@ function parseDoc(html) {
 // 该页有两个 id=kbtable 的表：第一个是课程格子，第二个是页脚的周次表。
 // getElementById 只返回第一个，故这里按「含星期表头」筛出课程表。
 function findCourseTable(doc) {
-    const tables = doc.querySelectorAll('table');
+    const tables = doc.querySelectorAll('table#kbtable');
     for (const t of tables) {
-        if (t.getAttribute('id') !== 'kbtable') continue;
         const head = t.querySelector('tr');
         if (head && /星期/.test(head.textContent)) return t;
     }
@@ -194,8 +188,8 @@ function parseKbContent(div) {
         const position = pick(['教室', '上课地点']);
         let weeks = pick(['周次(节次)', '周次', '节次']);
         const sd = pick(['单双周']);
-        // 部分页面的单双周是独立字段，需并入周次串统一处理
-        if (weeks && /单|双/.test(sd)) weeks += sd;
+        // 部分页面的单双周是独立字段，套上括号并入周次串以命中 parseWeeks 的括号匹配
+        if (weeks && /单|双/.test(sd)) weeks += '(' + sd + ')';
         out.push([name, teacher, position, weeks]);
     }
     return out;
@@ -242,10 +236,12 @@ function parseSchedule(input) {
             if (!div) return;
             // 同格拼课共用本格节次范围、靠周次区分先后，绝不能拆成不同节次
             for (const [name, teacher, position, weeksTxt] of parseKbContent(div)) {
+                const weeks = parseWeeks(weeksTxt);
+                if (weeks.length === 0) continue;
                 raw.push({
                     name, teacher, position,
                     day, startSection: section[0], endSection: section[1],
-                    weeksRaw: weeksTxt, weeks: parseWeeks(weeksTxt)
+                    weeksRaw: weeksTxt, weeks
                 });
             }
         });
@@ -275,7 +271,11 @@ function toWeekMonday(dateStr) {
 function parseSemesterFromTable(doc) {
     let startDate = null;
     let totalWeeks = null;
-    for (const table of doc.querySelectorAll('table')) {
+    const courseTable = findCourseTable(doc);
+    const kbTables = doc.querySelectorAll('table#kbtable');
+    const tables = kbTables.length > 0 ? kbTables : doc.querySelectorAll('table');
+    for (const table of tables) {
+        if (table === courseTable) continue;
         for (const row of table.querySelectorAll('tr')) {
             const blocks = row.textContent.match(/第\s*\d+\s*周\s*\d{4}-\d{2}-\d{2}/g);
             if (!blocks) continue;
@@ -300,11 +300,13 @@ function mergeCourses(courses) {
         a.name === b.name && a.teacher === b.teacher &&
         a.position === b.position && a.day === b.day;
     const weeksKey = c => (Array.isArray(c.weeks) ? c.weeks.join(',') : '');
-    const bySection = (a, b) =>
+    const byCourseBase = (a, b) =>
         (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) ||
         (a.teacher < b.teacher ? -1 : a.teacher > b.teacher ? 1 : 0) ||
         (a.position < b.position ? -1 : a.position > b.position ? 1 : 0) ||
-        (a.day || 0) - (b.day || 0) ||
+        (a.day || 0) - (b.day || 0);
+    const bySection = (a, b) =>
+        byCourseBase(a, b) ||
         (a.startSection || 0) - (b.startSection || 0) ||
         (a.endSection || 0) - (b.endSection || 0);
 
@@ -316,7 +318,13 @@ function mergeCourses(courses) {
         weeks: Array.isArray(c.weeks) ? c.weeks.slice().sort((a, b) => a - b) : []
     }));
 
-    list.sort((a, b) => bySection(a, b) || weeksKey(a).localeCompare(weeksKey(b)));
+    // 阶段 1 必须先按周次分组，再按节次排序，防止同节次不同周次的拼课插在连排课中间
+    list.sort((a, b) =>
+        byCourseBase(a, b) ||
+        weeksKey(a).localeCompare(weeksKey(b)) ||
+        (a.startSection || 0) - (b.startSection || 0) ||
+        (a.endSection || 0) - (b.endSection || 0)
+    );
     const step1 = [];
     let cur = list[0];
     for (let i = 1; i < list.length; i++) {
@@ -432,7 +440,7 @@ async function runImportFlow() {
         // 页面已有课表就直接用（含课表的「我的桌面」页也可）；
         // 都没有且还在教务域内，才发同源请求兜底
         const onPage = pageHasSchedule();
-        if (!onPage && !needFetchFallback()) {
+        if (!onPage && !isOnJwHost()) {
             window.shiguangBridge.showToast("请先登录并进入课表页");
             return;
         }
@@ -483,6 +491,7 @@ async function runImportFlow() {
                 window.shiguangBridge.showToast("已取消：未填写开学日期");
                 return;
             }
+            semesterStartDate = toWeekMonday(semesterStartDate);
         }
 
         await saveImportResult(courses, semesterStartDate, sem.totalWeeks || 20);
@@ -501,7 +510,7 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         parseSchedule, parseDoc, parseWeeks, parseSections, parseKbContent,
         mergeCourses, currentSemesterId, parseSemesterFromTable,
-        guessSemesterStartDate, cleanTeacher
+        guessSemesterStartDate, cleanTeacher, toWeekMonday
     };
 }
 
