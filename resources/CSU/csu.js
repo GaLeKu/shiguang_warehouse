@@ -278,24 +278,63 @@ function parseSchedule(html) {
     return mergeCourses(raw);
 }
 
-// 同名同师同地点且节次相邻 → 合并为一门连排课
+// 阶段 1 合并连排课（周次须相同，否则分阶段排课会被错并），阶段 2 合并同节次的周次
 function mergeCourses(courses) {
-    courses.sort((a, b) =>
+    if (!Array.isArray(courses) || courses.length <= 1) return courses;
+
+    const sameKey = (a, b) =>
+        a.name === b.name && a.teacher === b.teacher &&
+        a.position === b.position && a.day === b.day;
+    const weeksKey = c => (Array.isArray(c.weeks) ? c.weeks.join(',') : '');
+    const bySection = (a, b) =>
         (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) ||
-        a.day - b.day || a.startSection - b.startSection);
-    const out = [];
-    for (const c of courses) {
-        if (out.length) {
-            const p = out[out.length - 1];
-            if (p.name === c.name && p.teacher === c.teacher && p.position === c.position &&
-                p.day === c.day && p.endSection + 1 === c.startSection) {
-                p.endSection = c.endSection;
-                p.weeks = Array.from(new Set(p.weeks.concat(c.weeks))).sort((a, b) => a - b);
-                continue;
-            }
+        (a.teacher < b.teacher ? -1 : a.teacher > b.teacher ? 1 : 0) ||
+        (a.position < b.position ? -1 : a.position > b.position ? 1 : 0) ||
+        (a.day || 0) - (b.day || 0) ||
+        (a.startSection || 0) - (b.startSection || 0) ||
+        (a.endSection || 0) - (b.endSection || 0);
+
+    const list = courses.map(c => ({
+        ...c,
+        name: c.name || '',
+        teacher: c.teacher || '',
+        position: c.position || '',
+        weeks: Array.isArray(c.weeks) ? c.weeks.slice().sort((a, b) => a - b) : []
+    }));
+
+    list.sort((a, b) => bySection(a, b) || weeksKey(a).localeCompare(weeksKey(b)));
+    const step1 = [];
+    let cur = list[0];
+    for (let i = 1; i < list.length; i++) {
+        const next = list[i];
+        const isSameCourse = sameKey(cur, next) && weeksKey(cur) === weeksKey(next);
+        if (isSameCourse && next.startSection === cur.endSection + 1) {
+            cur.endSection = next.endSection;
+        } else if (isSameCourse && next.startSection === cur.startSection &&
+                   next.endSection === cur.endSection) {
+            continue;
+        } else {
+            step1.push(cur);
+            cur = next;
         }
-        out.push(Object.assign({}, c));
     }
+    step1.push(cur);
+
+    step1.sort(bySection);
+    const out = [];
+    cur = step1[0];
+    for (let i = 1; i < step1.length; i++) {
+        const next = step1[i];
+        if (sameKey(cur, next) &&
+            cur.startSection === next.startSection && cur.endSection === next.endSection) {
+            cur.weeks = Array.from(new Set(cur.weeks.concat(next.weeks))).sort((a, b) => a - b);
+        } else {
+            out.push(cur);
+            cur = next;
+        }
+    }
+    out.push(cur);
+
     return out;
 }
 
