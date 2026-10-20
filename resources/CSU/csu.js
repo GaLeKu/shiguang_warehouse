@@ -1,8 +1,9 @@
 // 中南大学 拾光课程表适配脚本
 // 教务：强智 jsxsd（与 CSUFT 同厂，但页面结构不同，不可照抄）
-// 入口：统一身份认证登录后进入教务系统，在课表页（或含课表的桌面页）点导入。
+// 入口：统一身份认证登录后进入教务系统，在课表页点导入。
 //       优先直接读当前页面 DOM——用户手动切过的学期只存在于页面里，
-//       自己发请求只会拿回服务端的默认学期。当前页读不到时才退回发请求。
+//       自己发请求只会拿回服务端的默认学期。
+//       课表可能在顶层，也可能在同源 iframe 里（框架页），故先顶层再扫 iframe。
 //
 // 四个必须注意的页面特征：
 //   ① 表头列序为「星期日、星期一…」，星期日在第 0 列，需映射为 day=7
@@ -32,16 +33,22 @@ function isOnJwHost() {
 }
 
 /**
- * 当前页是否带课表。
- * 不限具体路径：登录后的「我的桌面」等页面右侧也嵌了课表，同样直接读，
- * 这样页面显示的是哪个学期就导哪个学期。
+ * 找到带课表的 Document。
+ * 先看顶层，再看同源 iframe —— 强智的框架页会把子页面放进 iframe，
+ * 顶层查不到时会误判成「本页没课表」而丢掉用户切过的学期。
  */
-function pageHasSchedule() {
+function getScheduleDoc(rootDoc) {
     try {
-        return !!findCourseTable(document);
-    } catch (e) {
-        return false;
-    }
+        if (findCourseTable(rootDoc)) return rootDoc;
+        for (const frame of rootDoc.querySelectorAll('iframe')) {
+            try {
+                const subDoc = frame.contentDocument ||
+                    (frame.contentWindow && frame.contentWindow.document);
+                if (subDoc && findCourseTable(subDoc)) return subDoc;
+            } catch (e) { /* 跨域 iframe 取不到，忽略 */ }
+        }
+    } catch (e) { /* ignore */ }
+    return null;
 }
 
 const WEEKDAY_MAP = {
@@ -81,12 +88,12 @@ function findCourseTable(doc) {
     return null;
 }
 
-// '1－2' / '第5,6节' → [start, end]，取前两个数字
+// '1－2' / '第5,6节' → [start, end]
+// 取首尾两个数字：节次头写成 '1－2,3－4' 时表示 1~4 节连排，取前两个会丢掉后半段
 function parseSections(thText) {
     const nums = String(thText).match(/\d+/g);
     if (!nums) return null;
-    if (nums.length >= 2) return [parseInt(nums[0], 10), parseInt(nums[1], 10)];
-    return [parseInt(nums[0], 10), parseInt(nums[0], 10)];
+    return [parseInt(nums[0], 10), parseInt(nums[nums.length - 1], 10)];
 }
 
 // 周次：'3-12(周)' / '1,3,5(周)' / '2-4,8-20双周' / '3-12(周)[01-02节]'
@@ -360,9 +367,16 @@ function mergeCourses(courses) {
     return out;
 }
 
-// 供 showPrompt 按名调用的校验函数，返回字符串为错误提示，false 为通过
+// 供 showPrompt 按名调用的校验函数，返回字符串为错误提示，false 为通过。
+// 正则只能查格式，2026-02-29 这类「格式对但不存在的日期」要靠 Date 往返比对挡掉
 function validateDateInput(input) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(input)) return "请输入正确的日期格式：YYYY-MM-DD";
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(input || '').trim());
+    if (!m) return "请输入正确的日期格式：YYYY-MM-DD";
+    const year = parseInt(m[1], 10), month = parseInt(m[2], 10), day = parseInt(m[3], 10);
+    const d = new Date(year, month - 1, day);
+    if (d.getFullYear() !== year || d.getMonth() + 1 !== month || d.getDate() !== day) {
+        return "输入的日期在日历中不存在，请检查月/日";
+    }
     return false;
 }
 
@@ -407,9 +421,12 @@ async function runImportFlow() {
     window.__csuImportRunning = true;
 
     try {
-        // 页面已有课表就直接用（含课表的「我的桌面」页也可）；
+        // 优先直接读当前页面：用户切过的学期只存在于页面里，
+        // 自己发请求只会拿回服务端的默认学期
+        let doc = getScheduleDoc(document);
+        // 页面已有课表就直接用（含课表的「我的桌面」页、iframe 内的课表页也可）；
         // 都没有且还在教务域内，才发同源请求兜底
-        const onPage = pageHasSchedule();
+        const onPage = !!doc;
         if (!onPage && !isOnJwHost()) {
             window.shiguangBridge.showToast("请先登录并进入课表页");
             return;
@@ -428,7 +445,6 @@ async function runImportFlow() {
 
         // 优先用当前页面：用户切过的学期只存在于页面里，
         // 自己发请求只会拿回服务端的默认学期
-        let doc = onPage ? document : null;
         if (!doc) {
             try {
                 const resp = await fetch(location.origin + KB_PATH, {
