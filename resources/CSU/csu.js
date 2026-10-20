@@ -1,19 +1,15 @@
 // 中南大学 拾光课程表适配脚本
 // 教务：强智 jsxsd（与 CSUFT 同厂，但页面结构不同，不可照抄）
-// 入口：统一身份认证登录后进入教务系统，在课表页点导入。
-//       优先直接读当前页面 DOM——用户手动切过的学期只存在于页面里，
-//       自己发请求只会拿回服务端的默认学期。
-//       课表可能在顶层，也可能在同源 iframe 里（框架页），故先顶层再扫 iframe。
 //
-// 四个必须注意的页面特征：
+// 强智页面的四个坑：
 //   ① 表头列序为「星期日、星期一…」，星期日在第 0 列，需映射为 day=7
-//   ② 节次表头是全角连字符「1－2」，用 /\d+/g 取数字
-//   ③ 格内 kbcontent1 是隐藏旧数据，查询必须精确写 div.kbcontent，否则课程翻倍
-//   ④ 页面有两个 id=kbtable 的表，第二个是页脚周次表，开学日期与总周次从那里读
+//   ② 节次表头是全角连字符「1－2」
+//   ③ 格内 kbcontent1 是隐藏旧数据，必须精确取 div.kbcontent，否则课程翻倍
+//   ④ 有两个 id=kbtable：第一个课程表，第二个页脚周次表（开学日期与总周次）
 //
-// 整体包在 IIFE 里：App 每次点「执行导入」都会把本文件整个重新 evaluate 一次，
-// 顶层若直接写 const/function，第二次会抛 "Identifier 'KB_PATH' has already been
-// declared" —— 脚本在进入 runImportFlow 之前就崩了，点第二次毫无反应。
+// 优先读当前页面 DOM（用户切过的学期只存在于页面里，服务端新请求只会给默认学期），
+// 课表可能在顶层也可能在同源 iframe 内。整体包在 IIFE 里：App 每次点导入都会重新
+// evaluate 本文件，顶层直接写 const 会让第二次抛 "already been declared" 而崩掉。
 
 (function () {
 
@@ -32,11 +28,7 @@ function isOnJwHost() {
     }
 }
 
-/**
- * 找到带课表的 Document。
- * 先看顶层，再看同源 iframe —— 强智的框架页会把子页面放进 iframe，
- * 顶层查不到时会误判成「本页没课表」而丢掉用户切过的学期。
- */
+// 找带课表的 Document：先顶层，再扫同源 iframe（框架页把子页面放里面）
 function getScheduleDoc(rootDoc) {
     try {
         if (findCourseTable(rootDoc)) return rootDoc;
@@ -71,7 +63,7 @@ const TIME_SLOTS = [
     { number: 10, startTime: "19:55", endTime: "20:40" }
 ];
 
-// ===================== DOM 解析 =====================
+// ===== DOM 解析 =====
 
 function parseDoc(html) {
     return new DOMParser().parseFromString(html, 'text/html');
@@ -145,9 +137,8 @@ function cleanTeacher(s) {
 }
 
 // 解析 kbcontent 内的拼课块 → [[课程名, 教师, 教室, 周次原文], ...]
-// 拼课以 5 个以上连字符分隔，分隔符落在 <br> 之后的文本节点里。
-// 教师/教室/周次以 font 元素给出，每段各占一组（老师、周次、教室），
-// 故边走边收集：遇到分隔符就结算当前段，该段自带的 font 归它自己。
+// 拼课以 5 个以上连字符分隔（分隔符落在 <br> 之后的文本节点里），边走边收集：
+// 遇到分隔符就结算当前段，该段自带的 font 归它自己。
 function parseKbContent(div) {
     const parts = [];
     let buf = '';
@@ -203,7 +194,7 @@ function parseKbContent(div) {
 }
 
 // 主解析：课表页 → 合并后的课程数组。
-// 参数可以是 HTML 字符串，也可以是已 parseDoc 过的 document（nodeType 9），避免同一页重复解析
+// 传入 document（nodeType 9）可避免同一页重复解析
 function parseSchedule(input) {
     const doc = (input && input.nodeType === 9) ? input : parseDoc(input);
     const table = findCourseTable(doc);
@@ -256,10 +247,8 @@ function parseSchedule(input) {
     return mergeCourses(raw);
 }
 
-// 教务的周次表按「周日~周六」分周（如第1周 2026-09-06(日)~09-12(六)），
-// 而 App 的 firstDayOfWeek=1 要求开学日期是该周周一。
-// 直接把周日填进去会让整张课表前移一周（周四落到 09-03 而非 09-10），
-// 故统一推到该周的周一再交给 App。
+// 教务按「周日~周六」分周（如第1周 2026-09-06(日)~09-12)，而 App 要求开学日期是周一，
+// 直接填周日会让整张课表前移一周，故推到该周周一再写入。
 function toWeekMonday(dateStr) {
     const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ''));
     if (!m) return dateStr;
@@ -380,9 +369,9 @@ function validateDateInput(input) {
     return false;
 }
 
-// ===================== 导入流程 =====================
+// ===== 导入流程 =====
 
-/** 周次表读不到开学日期时的兜底：让用户手动输入 */
+// 周次表读不到开学日期时的兜底：让用户手动输入
 async function promptSemesterStartDate() {
     const input = await window.shiguangBridgePromise.showPrompt(
         "开学日期",
@@ -392,7 +381,7 @@ async function promptSemesterStartDate() {
     return (input != null && input !== "null" && /^\d{4}-\d{2}-\d{2}$/.test(input)) ? input : null;
 }
 
-/** 落库：课表配置 + 作息 + 课程 */
+// 落库：课表配置 + 作息 + 课程
 async function saveImportResult(courses, semesterStartDate, totalWeeks) {
     await window.shiguangBridgePromise.saveCourseConfig(JSON.stringify({
         semesterStartDate: semesterStartDate,
@@ -421,12 +410,9 @@ async function runImportFlow() {
     window.__csuImportRunning = true;
 
     try {
-        // 优先直接读当前页面：用户切过的学期只存在于页面里，
-        // 自己发请求只会拿回服务端的默认学期
         let doc = getScheduleDoc(document);
-        // 页面已有课表就直接用（含课表的「我的桌面」页、iframe 内的课表页也可）；
-        // 都没有且还在教务域内，才发同源请求兜底
         const onPage = !!doc;
+        // 本页无课表且不在教务域内，跨域请求会被 CORS 拦掉，直接拦下
         if (!onPage && !isOnJwHost()) {
             window.shiguangBridge.showToast("请先登录并进入课表页");
             return;
@@ -443,8 +429,8 @@ async function runImportFlow() {
 
         window.shiguangBridge.showToast("正在读取课表…");
 
-        // 优先用当前页面：用户切过的学期只存在于页面里，
-        // 自己发请求只会拿回服务端的默认学期
+        // 本页没有才发请求兜底：用户手动切过的学期只存在于页面里，
+        // 服务端的新请求只会返回默认学期
         if (!doc) {
             try {
                 const resp = await fetch(location.origin + KB_PATH, {
@@ -491,7 +477,7 @@ async function runImportFlow() {
     }
 }
 
-// Node 下把要供测试的函数交给外层；浏览器里没有 module，忽略即可
+// Node 下供测试取用；浏览器里没有 module，此段自动跳过
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         parseSchedule, parseDoc, parseWeeks, parseSections, parseKbContent,
