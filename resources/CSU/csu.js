@@ -360,36 +360,6 @@ function mergeCourses(courses) {
     return out;
 }
 
-// 页面当前选中的学期 id，仅用于开学日期兜底估算。
-// 优先读 select.value：用户在前端切换后 DOM property 会变，
-// 而 HTML attribute `selected` 仍停留在服务端渲染时的默认值。
-function currentSemesterId(doc) {
-    const select = doc.getElementById('xnxq01id');
-    if (!select) return null;
-    if (select.value) return select.value;
-    const opt = select.querySelector('option[selected]') || select.querySelector('option');
-    return opt ? opt.getAttribute('value') : null;
-}
-
-// 由 xnxq01id（如 2026-2027-1）估算开学日：1=当年 9 月首个周一，2=次年 2 月首个周一。
-// 仅在课表页周次表读不到时作为弹框默认值兜底，优先读页面真实值。
-function guessSemesterStartDate(semId) {
-    const m = /^(\d{4})-(\d{4})-(\d)$/.exec(semId || '');
-    if (!m) return null;
-    const startYear = parseInt(m[1], 10);
-    const term = parseInt(m[3], 10);
-    let year, month;
-    if (term === 1) { year = startYear; month = 9; }
-    else { year = startYear + 1; month = 2; }
-    const d = new Date(year, month - 1, 1);
-    const dow = d.getDay(); // 0=周日
-    const offset = (dow === 1) ? 0 : (dow === 0 ? 1 : 8 - dow);
-    d.setDate(d.getDate() + offset);
-    const mm = String(d.getMonth() + 1).padStart(2, '0');
-    const dd = String(d.getDate()).padStart(2, '0');
-    return `${d.getFullYear()}-${mm}-${dd}`;
-}
-
 // 供 showPrompt 按名调用的校验函数，返回字符串为错误提示，false 为通过
 function validateDateInput(input) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(input)) return "请输入正确的日期格式：YYYY-MM-DD";
@@ -398,12 +368,12 @@ function validateDateInput(input) {
 
 // ===================== 导入流程 =====================
 
-/** 周次表读不到开学日期时的兜底：估算一个默认值让用户确认或修改 */
-async function promptSemesterStartDate(semId) {
+/** 周次表读不到开学日期时的兜底：让用户手动输入 */
+async function promptSemesterStartDate() {
     const input = await window.shiguangBridgePromise.showPrompt(
         "开学日期",
         "未能从课表页读到开学日期，请手动输入(YYYY-MM-DD)：",
-        guessSemesterStartDate(semId) || "",
+        "",
         "validateDateInput");
     return (input != null && input !== "null" && /^\d{4}-\d{2}-\d{2}$/.test(input)) ? input : null;
 }
@@ -486,7 +456,7 @@ async function runImportFlow() {
         const sem = parseSemesterFromTable(doc);
         let semesterStartDate = sem.startDate;
         if (!semesterStartDate) {
-            semesterStartDate = await promptSemesterStartDate(currentSemesterId(doc));
+            semesterStartDate = await promptSemesterStartDate();
             if (!semesterStartDate) {
                 window.shiguangBridge.showToast("已取消：未填写开学日期");
                 return;
@@ -509,8 +479,7 @@ async function runImportFlow() {
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         parseSchedule, parseDoc, parseWeeks, parseSections, parseKbContent,
-        mergeCourses, currentSemesterId, parseSemesterFromTable,
-        guessSemesterStartDate, cleanTeacher, toWeekMonday
+        mergeCourses, parseSemesterFromTable, cleanTeacher, toWeekMonday
     };
 }
 
