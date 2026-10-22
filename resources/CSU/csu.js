@@ -1,46 +1,99 @@
-// 中南大学 拾光课程表适配脚本
-// 教务：强智 jsxsd（与 CSUFT 同厂，但页面结构不同，不可照抄）
+// 中南大学 拾光课程表适配脚本（强智 jsxsd，与 CSUFT 同厂但页面结构不同）
 //
-// 强智页面的四个坑：
+// 四个坑：
 //   ① 表头列序为「星期日、星期一…」，星期日在第 0 列，需映射为 day=7
 //   ② 节次表头是全角连字符「1－2」
 //   ③ 格内 kbcontent1 是隐藏旧数据，必须精确取 div.kbcontent，否则课程翻倍
-//   ④ 有两个 id=kbtable：第一个课程表，第二个页脚周次表（开学日期与总周次）
+//   ④ 课表页有两个 id=kbtable：第一个是课程表，第二个是页脚周次表
 //
-// 优先读当前页面 DOM（用户切过的学期只存在于页面里，服务端新请求只会给默认学期），
-// 课表可能在顶层也可能在同源 iframe 内。整体包在 IIFE 里：App 每次点导入都会重新
+// 数据全部走同源请求，不读当前页面。整体包在 IIFE 里：App 每次点导入都会重新
 // evaluate 本文件，顶层直接写 const 会让第二次抛 "already been declared" 而崩掉。
 
 (function () {
 
 const KB_PATH = "/jsxsd/xskb/xskb_list.do";
+const JXZL_PATH = "/jsxsd/jxzl/jxzl_query";   // 教学周历：学期列表 + 开学日期 + 总周次
 
-// 该校按学号把请求分摊到多台服务器（csujwc / csujwc2 …），故按后缀匹配
-const JW_HOST_SUFFIX = '.its.csu.edu.cn';
+// 网络请求：与适配案例一一对应，返回 HTML 文本，解析交给调用方
 
-function isOnJwHost() {
-    try {
-        if (typeof location === 'undefined' || !location.href) return false;
-        const m = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(String(location.href));
-        return !!m && m[1].toLowerCase().endsWith(JW_HOST_SUFFIX);
-    } catch (e) {
-        return false;
+// 同源请求：有 body 走 POST，否则 GET
+async function requestPage(path, body) {
+    const opt = { method: body ? "POST" : "GET", credentials: "include" };
+    if (body) {
+        opt.headers = { "Content-Type": "application/x-www-form-urlencoded" };
+        opt.body = body;
     }
+    const resp = await fetch(location.origin + path, opt);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    return await resp.text();
 }
 
-// 找带课表的 Document：先顶层，再扫同源 iframe（框架页把子页面放里面）
-function getScheduleDoc(rootDoc) {
-    try {
-        if (findCourseTable(rootDoc)) return rootDoc;
-        for (const frame of rootDoc.querySelectorAll('iframe')) {
-            try {
-                const subDoc = frame.contentDocument ||
-                    (frame.contentWindow && frame.contentWindow.document);
-                if (subDoc && findCourseTable(subDoc)) return subDoc;
-            } catch (e) { /* 跨域 iframe 取不到，忽略 */ }
-        }
-    } catch (e) { /* ignore */ }
-    return null;
+// 三个入口与适配案例同名，便于对照
+function requestSemesterPage() {
+    return requestPage(JXZL_PATH);
+}
+
+function requestSemesterDetailPage(semesterId) {
+    return requestPage(JXZL_PATH, "xnxq01id=" + encodeURIComponent(semesterId));
+}
+
+function requestCoursePage(semesterId) {
+    return requestPage(KB_PATH, "cj0701id=&zc=&demo=&xnxq01id=" + encodeURIComponent(semesterId));
+}
+
+// 中南共 9 个学期，全列；案例的「上下各 3 个」会选不到更早的学期
+async function fetchSemesterList() {
+    const doc = parseDoc(await requestSemesterPage());
+    const select = doc.getElementById("xnxq01id");
+    const all = select ? Array.from(select.querySelectorAll("option"))
+        .map(o => ({
+            value: o.value,
+            label: (o.textContent || "").trim(),
+            selected: o.hasAttribute("selected")
+        }))
+        .filter(o => o.value) : [];
+    if (all.length === 0) return { list: [], defaultIndex: 0 };
+
+    let idx = all.findIndex(o => o.selected);
+    if (idx < 0) idx = 0;
+    return { list: all, defaultIndex: idx };
+}
+
+// 开学日期、总周次、周起始日。
+// 教务不同学期的周起始并不一致：周日列有日期就从周日起算（firstDayOfWeek=7），
+// 该列留空则第 1 周从周一开始（=1）。取第 1 行第一个日期格，按它自己的星期判断。
+async function fetchSemesterInfo(semesterId) {
+    const doc = parseDoc(await requestSemesterDetailPage(semesterId));
+    const table = doc.getElementById("kbtable");
+    const rows = table
+        ? Array.from(table.querySelectorAll("tr")).filter(r => r.querySelector("td"))
+        : [];
+    if (rows.length === 0) return { startDate: null, totalWeeks: null, firstDayOfWeek: 7 };
+
+    let startDate = null;
+    let firstDayOfWeek = 7;
+    const cell = rows[0].querySelector("td[title]");
+    const m = /^(\d{4})年(\d{2})月(\d{2})/.exec(cell ? (cell.getAttribute("title") || "") : "");
+    if (m) {
+        startDate = m[1] + "-" + m[2] + "-" + m[3];
+        const d = new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
+        firstDayOfWeek = d.getDay() === 0 ? 7 : 1;
+    }
+
+    let totalWeeks = null;
+    for (const row of rows) {
+        const first = row.querySelector("td");
+        const n = parseInt(first ? first.textContent.trim() : "", 10);
+        if (!isNaN(n) && n > 0 && (totalWeeks === null || n > totalWeeks)) totalWeeks = n;
+    }
+    return { startDate, totalWeeks, firstDayOfWeek };
+}
+
+async function fetchCourses(semesterId) {
+    const doc = parseDoc(await requestCoursePage(semesterId));
+    // 教学周历页同样有 table#kbtable，用 kbcontent 判断是不是真正的课表
+    if (!doc.querySelector("div.kbcontent")) throw new Error("返回页面里没有课程，请确认已登录");
+    return parseSchedule(doc);
 }
 
 const WEEKDAY_MAP = {
@@ -63,14 +116,11 @@ const TIME_SLOTS = [
     { number: 10, startTime: "19:55", endTime: "20:40" }
 ];
 
-// ===== DOM 解析 =====
-
 function parseDoc(html) {
     return new DOMParser().parseFromString(html, 'text/html');
 }
 
-// 该页有两个 id=kbtable 的表：第一个是课程格子，第二个是页脚的周次表。
-// getElementById 只返回第一个，故这里按「含星期表头」筛出课程表。
+// 两个 id=kbtable（课程格子 / 页脚周次表），按「含星期表头」筛出课程表
 function findCourseTable(doc) {
     const tables = doc.querySelectorAll('table#kbtable');
     for (const t of tables) {
@@ -80,8 +130,7 @@ function findCourseTable(doc) {
     return null;
 }
 
-// '1－2' / '第5,6节' → [start, end]
-// 取首尾两个数字：节次头写成 '1－2,3－4' 时表示 1~4 节连排，取前两个会丢掉后半段
+// '1－2' → [1,2]；取首尾数字，'1－2,3－4' 表示 1~4 节连排
 function parseSections(thText) {
     const nums = String(thText).match(/\d+/g);
     if (!nums) return null;
@@ -137,8 +186,7 @@ function cleanTeacher(s) {
 }
 
 // 解析 kbcontent 内的拼课块 → [[课程名, 教师, 教室, 周次原文], ...]
-// 拼课以 5 个以上连字符分隔（分隔符落在 <br> 之后的文本节点里），边走边收集：
-// 遇到分隔符就结算当前段，该段自带的 font 归它自己。
+// 拼课以 5 个以上连字符分隔，分隔符落在 <br> 之后的文本节点里，遇分隔符结算当前段
 function parseKbContent(div) {
     const parts = [];
     let buf = '';
@@ -193,8 +241,7 @@ function parseKbContent(div) {
     return out;
 }
 
-// 主解析：课表页 → 合并后的课程数组。
-// 传入 document（nodeType 9）可避免同一页重复解析
+// 主解析：课表页 → 合并后的课程数组，接受 Document 或 HTML 字符串
 function parseSchedule(input) {
     const doc = (input && input.nodeType === 9) ? input : parseDoc(input);
     const table = findCourseTable(doc);
@@ -207,7 +254,6 @@ function parseSchedule(input) {
         const ths = Array.from(row.querySelectorAll('th'));
         const tds = Array.from(row.querySelectorAll('td'));
 
-        // 表头行：任一 th 含「星期」
         if (ths.some(th => th.textContent.indexOf('星期') >= 0)) {
             ths.forEach((th, ci) => {
                 if (ci === 0) return; // 第 0 列是节次标签列
@@ -245,47 +291,6 @@ function parseSchedule(input) {
         });
     }
     return mergeCourses(raw);
-}
-
-// 教务按「周日~周六」分周（如第1周 2026-09-06(日)~09-12)，而 App 要求开学日期是周一，
-// 直接填周日会让整张课表前移一周，故推到该周周一再写入。
-function toWeekMonday(dateStr) {
-    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ''));
-    if (!m) return dateStr;
-    const d = new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
-    const wd = d.getDay();          // 0=周日
-    if (wd === 1) return dateStr;    // 已是周一
-    // 周日→+1 天到周一；其余（周二~周六）→ 前移到本周周一
-    const delta = wd === 0 ? 1 : 1 - wd;
-    d.setDate(d.getDate() + delta);
-    const p = n => (n < 10 ? '0' : '') + n;
-    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
-}
-
-// 从课表页底部自带的周次表读取真实开学日期与总周次。
-// 该周次表与课程格子同属这一个页面请求（是第二个 id=kbtable），不必再请求教学周历页。
-function parseSemesterFromTable(doc) {
-    let startDate = null;
-    let totalWeeks = null;
-    const courseTable = findCourseTable(doc);
-    const kbTables = doc.querySelectorAll('table#kbtable');
-    const tables = kbTables.length > 0 ? kbTables : doc.querySelectorAll('table');
-    for (const table of tables) {
-        if (table === courseTable) continue;
-        for (const row of table.querySelectorAll('tr')) {
-            const blocks = row.textContent.match(/第\s*\d+\s*周\s*\d{4}-\d{2}-\d{2}/g);
-            if (!blocks) continue;
-            for (const b of blocks) {
-                const m = /第\s*(\d+)\s*周\s*(\d{4})-(\d{2})-(\d{2})/.exec(b);
-                if (!m) continue;
-                const w = parseInt(m[1], 10);
-                if (w > 0 && (totalWeeks === null || w > totalWeeks)) totalWeeks = w;
-                if (w === 1 && !startDate) startDate = m[2] + '-' + m[3] + '-' + m[4];
-            }
-        }
-    }
-    if (startDate) startDate = toWeekMonday(startDate);
-    return { startDate, totalWeeks };
 }
 
 // 阶段 1 合并连排课（周次须相同，否则分阶段排课会被错并），阶段 2 合并同节次的周次
@@ -356,40 +361,22 @@ function mergeCourses(courses) {
     return out;
 }
 
-// 供 showPrompt 按名调用的校验函数，返回字符串为错误提示，false 为通过。
-// 正则只能查格式，2026-02-29 这类「格式对但不存在的日期」要靠 Date 往返比对挡掉
-function validateDateInput(input) {
-    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(input || '').trim());
-    if (!m) return "请输入正确的日期格式：YYYY-MM-DD";
-    const year = parseInt(m[1], 10), month = parseInt(m[2], 10), day = parseInt(m[3], 10);
-    const d = new Date(year, month - 1, day);
-    if (d.getFullYear() !== year || d.getMonth() + 1 !== month || d.getDate() !== day) {
-        return "输入的日期在日历中不存在，请检查月/日";
-    }
-    return false;
+async function saveAppConfig(semesterStartDate, totalWeeks, firstDayOfWeek) {
+    // 周起始随学期而定：周日列有日期为 7，否则为 1（见 fetchSemesterInfo）
+    const config = {
+        "semesterStartDate": semesterStartDate,
+        "semesterTotalWeeks": totalWeeks || 20,
+        "firstDayOfWeek": firstDayOfWeek
+    };
+    return await window.shiguangBridgePromise.saveCourseConfig(JSON.stringify(config));
 }
 
-// ===== 导入流程 =====
-
-// 周次表读不到开学日期时的兜底：让用户手动输入
-async function promptSemesterStartDate() {
-    const input = await window.shiguangBridgePromise.showPrompt(
-        "开学日期",
-        "未能从课表页读到开学日期，请手动输入(YYYY-MM-DD)：",
-        "",
-        "validateDateInput");
-    return (input != null && input !== "null" && /^\d{4}-\d{2}-\d{2}$/.test(input)) ? input : null;
+async function saveAppTimeSlots() {
+    return await window.shiguangBridgePromise.savePresetTimeSlots(JSON.stringify(TIME_SLOTS));
 }
 
-// 落库：课表配置 + 作息 + 课程
-async function saveImportResult(courses, semesterStartDate, totalWeeks) {
-    await window.shiguangBridgePromise.saveCourseConfig(JSON.stringify({
-        semesterStartDate: semesterStartDate,
-        semesterTotalWeeks: totalWeeks,
-        firstDayOfWeek: 1
-    }));
-    await window.shiguangBridgePromise.savePresetTimeSlots(JSON.stringify(TIME_SLOTS));
-    await window.shiguangBridgePromise.saveImportedCourses(JSON.stringify(courses.map(c => ({
+async function saveImportedCourses(courses) {
+    return await window.shiguangBridgePromise.saveImportedCourses(JSON.stringify(courses.map(c => ({
         name: c.name,
         teacher: c.teacher,
         position: c.position,
@@ -401,79 +388,64 @@ async function saveImportResult(courses, semesterStartDate, totalWeeks) {
 }
 
 async function runImportFlow() {
-    // App 每次点「执行导入」都会把整个脚本重新注入一遍，
-    // 若上一轮还停在 showAlert 等待确认，并发跑两轮会导致第二次没反应
-    if (window.__csuImportRunning) {
-        window.shiguangBridge.showToast("请先在弹窗上确认或取消");
-        return;
-    }
-    window.__csuImportRunning = true;
-
     try {
-        let doc = getScheduleDoc(document);
-        const onPage = !!doc;
-        // 本页无课表且不在教务域内，跨域请求会被 CORS 拦掉，直接拦下
-        if (!onPage && !isOnJwHost()) {
-            window.shiguangBridge.showToast("请先登录并进入课表页");
+        // 停在统一认证页时教务接口会 404，提前拦下
+        const host = (/^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(String(location.href || '')) || [])[1] || '';
+        if (!host.toLowerCase().endsWith('.its.csu.edu.cn')) {
+            window.shiguangBridge.showToast("导入失败：请先登录教务系统");
             return;
         }
 
+        // 1. 用户确认
         const confirmed = await window.shiguangBridgePromise.showAlert(
             "导入前确认",
-            onPage
-                ? "将导入当前页面上显示的课表。\n\n"
-                  + "请先确认这就是你要导入的课表；想换学期，请先在课表页左上角切换「学年学期」。\n\n现在继续？"
-                : "将读取教务系统的课表。\n\n现在继续？",
+            "将从教务系统读取课表，导入可在任意教务页面进行。\n\n现在继续？",
             "开始导入");
         if (!confirmed) return;
 
-        window.shiguangBridge.showToast("正在读取课表…");
-
-        // 本页没有才发请求兜底：用户手动切过的学期只存在于页面里，
-        // 服务端的新请求只会返回默认学期
-        if (!doc) {
-            try {
-                const resp = await fetch(location.origin + KB_PATH, {
-                    method: "GET",
-                    credentials: "include"
-                });
-                doc = parseDoc(await resp.text());
-            } catch (err) {
-                window.shiguangBridge.showToast("请求失败：" + ((err && err.message) ? err.message : err));
-                return;
-            }
-            if (!findCourseTable(doc)) {
-                window.shiguangBridge.showToast("没读到课表，请确认已登录");
-                return;
-            }
-        }
-
-        const courses = parseSchedule(doc);
-        if (courses.length === 0) {
-            window.shiguangBridge.showToast("当前页没有课程，请刷新重试");
+        // 2. 获取学期列表
+        window.shiguangBridge.showToast("正在获取学期列表…");
+        const { list: semesters, defaultIndex } = await fetchSemesterList();
+        if (semesters.length === 0) {
+            window.shiguangBridge.showToast("导入失败：未获取到学期列表");
             return;
         }
 
-        // 开学日期与总周次读课表页自带的周次表，读不到才让用户手填
-        const sem = parseSemesterFromTable(doc);
-        let semesterStartDate = sem.startDate;
-        if (!semesterStartDate) {
-            semesterStartDate = await promptSemesterStartDate();
-            if (!semesterStartDate) {
-                window.shiguangBridge.showToast("已取消：未填写开学日期");
-                return;
-            }
-            semesterStartDate = toWeekMonday(semesterStartDate);
+        // 3. 用户选择学期
+        const selectedIndex = await window.shiguangBridgePromise.showSingleSelection(
+            "选择学期", JSON.stringify(semesters.map(s => s.label)), defaultIndex);
+        if (selectedIndex === null || selectedIndex === undefined || selectedIndex < 0) return;
+        const semesterId = semesters[selectedIndex].value;
+
+        // 4. 获取开学日期 + 总周次
+        window.shiguangBridge.showToast("正在获取学期信息…");
+        const { startDate, totalWeeks, firstDayOfWeek } = await fetchSemesterInfo(semesterId);
+
+        // 5. 读不到开学日期直接退出，不猜也不让用户手填
+        if (!startDate) {
+            window.shiguangBridge.showToast("导入失败：未读到开学日期");
+            return;
         }
 
-        await saveImportResult(courses, semesterStartDate, sem.totalWeeks || 20);
+        // 6. 获取课程
+        window.shiguangBridge.showToast("正在请求课程数据…");
+        const courses = await fetchCourses(semesterId);
+        if (courses.length === 0) {
+            window.shiguangBridge.showToast("导入失败：该学期没有课程");
+            return;
+        }
 
-        window.shiguangBridge.showToast("成功导入 " + courses.length + " 门课程");
+        // 7. 保存配置
+        await saveAppConfig(startDate, totalWeeks, firstDayOfWeek);
+        await saveAppTimeSlots();
+        await saveImportedCourses(courses);
+
+        // 8. 完成：三个 save 已各自提示过结果，这里只做收尾跳转
         window.shiguangBridge.notifyTaskCompletion();
     } catch (err) {
-        window.shiguangBridge.showToast("错误: " + (err && err.message ? err.message : err));
-    } finally {
-        window.__csuImportRunning = false;
+        // App 侧 reject 的文案多数已带「失败」，避免出现「导入失败：课程导入失败: …」
+        const msg = String((err && err.message) ? err.message : err);
+        window.shiguangBridge.showToast(msg.includes("失败") ? msg : "导入失败：" + msg);
     }
 }
 
@@ -481,14 +453,13 @@ async function runImportFlow() {
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         parseSchedule, parseDoc, parseWeeks, parseSections, parseKbContent,
-        mergeCourses, parseSemesterFromTable, cleanTeacher, toWeekMonday
+        mergeCourses, cleanTeacher, fetchSemesterList, fetchSemesterInfo, fetchCourses
     };
 }
 
-// 供 showPrompt 按字符串名回调的校验函数，IIFE 内需显式挂到 window
+// 挂出口供离线测试直接驱动流程
 if (typeof window !== 'undefined') {
-    window.validateDateInput = validateDateInput;
-    window.runImportFlow = runImportFlow;   // 挂出口供离线测试直接驱动流程
+    window.runImportFlow = runImportFlow;
 }
 
 // 入口：WebView 中桥接就绪即执行
